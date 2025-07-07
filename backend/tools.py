@@ -193,7 +193,15 @@ async def call_tool(tool_name: str, args: Dict[str, Any]) -> str:
 async def research_planner(query: str, client: AsyncOpenAI) -> dict:
     """Takes user query and creates structured research plan."""
     try:
-        prompt = f"""Analyze this research query and break it into 3-4 specific research directions that will lead to a comprehensive answer. Focus on what information is needed: {query}. Return as JSON with 'research_goals' array and 'reasoning' string."""
+        prompt = f"""Analyze this research query: {query}
+
+Break it into 3-4 specific research directions. You must respond with ONLY valid JSON in this exact format:
+{{
+  "research_goals": ["goal 1", "goal 2", "goal 3"],
+  "reasoning": "explanation of why these goals"
+}}
+
+Query: {query}"""
         
         response = await client.chat.completions.create(
             model=MODEL_NAME,
@@ -213,7 +221,14 @@ async def research_planner(query: str, client: AsyncOpenAI) -> dict:
 async def extract_learnings(search_results: str, research_goal: str, client: AsyncOpenAI) -> dict:
     """Takes raw search results and extracts key insights for a specific research goal."""
     try:
-        prompt = f"""Extract key insights from these search results for research goal '{research_goal}'. Focus on facts, data, and actionable information. Identify knowledge gaps. Return as JSON with 'insights' array, 'gaps' array, and 'sources' array:
+        prompt = f"""Extract insights from these search results for goal: {research_goal}
+
+You must respond with ONLY valid JSON in this exact format:
+{{
+  "insights": ["insight 1", "insight 2"],
+  "gaps": ["gap 1", "gap 2"], 
+  "sources": ["url1", "url2"]
+}}
 
 Search Results:
 {search_results}"""
@@ -238,7 +253,10 @@ async def generate_next_queries(learnings: List[dict], original_query: str, clie
     """Based on current learnings, generates next search queries to fill gaps."""
     try:
         learnings_str = json.dumps(learnings, indent=2)
-        prompt = f"""Based on these research learnings, generate 2-4 specific search queries to complete research on '{original_query}'. Focus on filling knowledge gaps. Return as JSON array of strings:
+        prompt = f"""Based on these learnings, generate 2-4 search queries for: {original_query}
+
+You must respond with ONLY a JSON array like this:
+["query 1", "query 2", "query 3"]
 
 Learnings:
 {learnings_str}"""
