@@ -6,8 +6,14 @@ from typing import List, Dict, Any, Optional, AsyncGenerator
 import json
 import asyncio
 import os
+import uuid
+from datetime import datetime
 from openai import AsyncOpenAI
-from tools import search_web, write_file, get_weather, call_tool, send_email
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+from tools import search_web, write_file, get_weather, call_tool, send_email, research_planner, extract_learnings, generate_next_queries, synthesize_report
 
 app = FastAPI(title="Deep Research Agent API")
 
@@ -20,8 +26,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Configuration
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
 # Initialize OpenAI client
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "api-key"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key or api_key == "api-key":
+    print(f"Warning: OPENAI_API_KEY not found or invalid. Current value: {api_key}")
+    print("Please check your .env file contains: OPENAI_API_KEY=your-actual-key")
+else:
+    print(f"OpenAI API key loaded successfully (length: {len(api_key)})")
+
+client = AsyncOpenAI(api_key=api_key)
+
+# Research session storage
+sessions: Dict[str, 'ResearchSession'] = {}
 
 class Message(BaseModel):
     role: str
@@ -31,6 +50,31 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     tools: List[str] = []
     deep_research_mode: bool = False
+
+class ResearchSession(BaseModel):
+    research_id: str
+    original_query: str
+    research_goals: List[str]
+    learnings: List[Dict[str, Any]]
+    current_depth: int
+    max_depth: int
+    current_breadth: int
+    max_breadth: int
+    iteration_count: int
+    status: str  # "planning", "researching", "complete"
+    created_at: datetime
+    updated_at: datetime
+
+class ResearchStartRequest(BaseModel):
+    query: str
+    research_goals: List[str] = []
+    max_depth: int = 3
+    max_breadth: int = 5
+
+class ResearchExecuteRequest(BaseModel):
+    tools: List[str] = []
+
+
 
 def get_system_prompt(available_tools: List[str]) -> str:
     """Generate system prompt based on available tools."""
@@ -100,7 +144,7 @@ async def stream_simple_completion(messages: List[Dict]) -> AsyncGenerator[str, 
         openai_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
         openai_messages.insert(0, {"role": "system", "content": conversational_system_prompt})
         
-        stream = await client.chat.completions.create(model="gpt-4", messages=openai_messages, stream=True, temperature=0.7)
+        stream = await client.chat.completions.create(model=MODEL_NAME, messages=openai_messages, stream=True, temperature=0.7)
         
         yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
         async for chunk in stream:
@@ -130,10 +174,12 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
             
             # Get LLM response
             response = await client.chat.completions.create(
-                model="gpt-4",
+                model=MODEL_NAME,
                 messages=research_messages,
                 temperature=0.7
             )
+            
+
             
             content = response.choices[0].message.content
             
@@ -192,6 +238,235 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
 
+# Research Session Management Functions
+def create_research_session(query: str, research_goals: List[str], max_depth: int, max_breadth: int) -> ResearchSession:
+    """Create a new research session."""
+    research_id = str(uuid.uuid4())
+    now = datetime.now()
+    
+    session = ResearchSession(
+        research_id=research_id,
+        original_query=query,
+        research_goals=research_goals or [query],
+        learnings=[],
+        current_depth=0,
+        max_depth=max_depth,
+        current_breadth=0,
+        max_breadth=max_breadth,
+        iteration_count=0,
+        status="planning",
+        created_at=now,
+        updated_at=now
+    )
+    
+    sessions[research_id] = session
+    return session
+
+def get_research_session(research_id: str) -> Optional[ResearchSession]:
+    """Get a research session by ID."""
+    return sessions.get(research_id)
+
+def update_research_session(research_id: str, **kwargs) -> Optional[ResearchSession]:
+    """Update a research session."""
+    if research_id in sessions:
+        session = sessions[research_id]
+        for key, value in kwargs.items():
+            if hasattr(session, key):
+                setattr(session, key, value)
+        session.updated_at = datetime.now()
+        return session
+    return None
+
+# New Research Endpoints
+@app.post("/research/start")
+async def start_research(request: ResearchStartRequest):
+    """Start a new research session."""
+    try:
+        session = create_research_session(
+            query=request.query,
+            research_goals=request.research_goals,
+            max_depth=request.max_depth,
+            max_breadth=request.max_breadth
+        )
+        
+        return {
+            "research_id": session.research_id,
+            "status": session.status,
+            "message": "Research session created successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/research/{research_id}/status")
+async def get_research_status(research_id: str):
+    """Get the current status of a research session."""
+    session = get_research_session(research_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Research session not found")
+    
+    return {
+        "research_id": session.research_id,
+        "original_query": session.original_query,
+        "research_goals": session.research_goals,
+        "current_depth": session.current_depth,
+        "max_depth": session.max_depth,
+        "current_breadth": session.current_breadth,
+        "max_breadth": session.max_breadth,
+        "iteration_count": session.iteration_count,
+        "status": session.status,
+        "learnings_count": len(session.learnings),
+        "created_at": session.created_at.isoformat(),
+        "updated_at": session.updated_at.isoformat()
+    }
+
+async def stream_research_execution(research_id: str, request: ResearchExecuteRequest) -> AsyncGenerator[str, None]:
+    """Stream the iterative research execution."""
+    try:
+        session = get_research_session(research_id)
+        if not session:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Research session not found'})}\n\n"
+            return
+        
+        if session.status == "complete":
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Research session already completed'})}\n\n"
+            return
+        
+        # Update session status
+        update_research_session(research_id, status="researching")
+        
+        # Initialize research goals if this is the first iteration
+        if session.iteration_count == 0:
+            yield f"data: {json.dumps({'type': 'research_status', 'message': 'Planning research strategy...'})}\n\n"
+            
+            plan = await research_planner(session.original_query, client)
+            if plan.get("research_goals"):
+                update_research_session(research_id, research_goals=plan["research_goals"])
+                yield f"data: {json.dumps({'type': 'research_plan', 'goals': plan['research_goals'], 'reasoning': plan.get('reasoning', '')})}\n\n"
+        
+        total_searches = 0
+        max_total_searches = 20  # Cost control
+        
+        # Main research loop
+        while session.current_depth < session.max_depth and total_searches < max_total_searches:
+            session = get_research_session(research_id)  # Refresh session state
+            
+            # Generate next queries
+            next_queries = await generate_next_queries(session.learnings, session.original_query, client)
+            
+            if not next_queries:
+                yield f"data: {json.dumps({'type': 'research_status', 'message': 'No more queries needed - research complete'})}\n\n"
+                break
+            
+            # Limit to max_breadth queries
+            queries_to_execute = next_queries[:session.max_breadth]
+            total_searches += len(queries_to_execute)
+            
+            # Stream current iteration status
+            message = f'Executing {len(queries_to_execute)} searches for depth {session.current_depth + 1}'
+            status_data = {
+                'type': 'research_status', 
+                'depth': session.current_depth + 1, 
+                'iteration': session.iteration_count + 1, 
+                'queries': queries_to_execute,
+                'message': message
+            }
+            yield f"data: {json.dumps(status_data)}\n\n"
+            
+            # Execute searches in parallel
+            search_tasks = [search_web(query) for query in queries_to_execute]
+            search_results = await asyncio.gather(*search_tasks)
+            
+            # Extract learnings from each result
+            new_learnings = []
+            for i, (query, result) in enumerate(zip(queries_to_execute, search_results)):
+                # Extract learnings for each research goal
+                for goal in session.research_goals:
+                    learning = await extract_learnings(result, goal, client)
+                    
+                    if learning.get("insights"):
+                        new_learning = {
+                            "query": query,
+                            "goal": goal,
+                            "insights": learning.get("insights", []),
+                            "gaps": learning.get("gaps", []),
+                            "sources": learning.get("sources", []),
+                            "iteration": session.iteration_count + 1,
+                            "depth": session.current_depth + 1
+                        }
+                        new_learnings.append(new_learning)
+                        
+                        # Stream individual learning
+                        for insight in learning.get("insights", []):
+                            source = learning.get('sources', [''])[0] if learning.get('sources') else ''
+                            learning_data = {
+                                'type': 'learning',
+                                'insight': insight,
+                                'source': source,
+                                'iteration': session.iteration_count + 1,
+                                'goal': goal
+                            }
+                            yield f"data: {json.dumps(learning_data)}\n\n"
+            
+            # Update session with new learnings
+            if new_learnings:
+                update_research_session(research_id, 
+                    learnings=session.learnings + new_learnings,
+                    current_depth=session.current_depth + 1,
+                    iteration_count=session.iteration_count + 1)
+                
+                iteration_data = {
+                    'type': 'iteration_complete', 
+                    'depth': session.current_depth + 1,
+                    'new_learnings': len(new_learnings),
+                    'total_learnings': len(session.learnings) + len(new_learnings)
+                }
+                yield f"data: {json.dumps(iteration_data)}\n\n"
+            else:
+                # No new learnings found
+                no_insights_data = {
+                    'type': 'research_status', 
+                    'message': 'No new insights found in this iteration'
+                }
+                yield f"data: {json.dumps(no_insights_data)}\n\n"
+                break
+        
+        # Generate final report
+        session = get_research_session(research_id)  # Get final session state
+        generating_report_data = {
+            'type': 'research_status', 
+            'message': 'Generating final research report...'
+        }
+        yield f"data: {json.dumps(generating_report_data)}\n\n"
+        
+        final_report = await synthesize_report(session.learnings, session.original_query, client)
+        
+        # Mark session as complete
+        update_research_session(research_id, status="complete")
+        
+        # Stream final report
+        final_report_data = {
+            'type': 'research_complete', 
+            'total_learnings': len(session.learnings),
+            'final_report': final_report,
+            'total_searches': total_searches,
+            'final_depth': session.current_depth
+        }
+        yield f"data: {json.dumps(final_report_data)}\n\n"
+        
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+@app.post("/research/{research_id}/execute")
+async def execute_research(research_id: str, request: ResearchExecuteRequest):
+    """Execute the research loop for a session."""
+    return StreamingResponse(stream_research_execution(research_id, request), media_type="text/plain")
+
+
+
+# Existing endpoints (unchanged for backward compatibility)
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
@@ -226,7 +501,7 @@ async def stream_file_explanation(file_content: str, filename: str) -> AsyncGene
         user_prompt = f"Filename: {filename}\n\nFile Content:\n---\n{file_content[:10000]}\n---\n\nPlease provide a detailed explanation of this file. What is its purpose, what does it do, and what are the key components?"
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         
-        stream = await client.chat.completions.create(model="gpt-4", messages=messages, stream=True, temperature=0.5)
+        stream = await client.chat.completions.create(model=MODEL_NAME, messages=messages, stream=True, temperature=0.5)
         
         yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
         async for chunk in stream:

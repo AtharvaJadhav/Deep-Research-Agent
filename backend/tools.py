@@ -3,9 +3,13 @@ import asyncio
 import os
 import json
 import aiofiles
-from typing import Dict, Any
+from typing import Dict, Any, List
 from pathlib import Path
 import requests
+from openai import AsyncOpenAI
+
+# Get model name from environment (same as app.py)
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 async def search_web(query: str) -> str:
     """Search the web using Serper API or fallback to mock results."""
@@ -184,3 +188,95 @@ async def call_tool(tool_name: str, args: Dict[str, Any]) -> str:
         return await send_email(args.get("to", ""), args.get("subject", ""), args.get("body", ""))
     else:
         return f"Unknown tool: {tool_name}"
+
+# Research-specific functions
+async def research_planner(query: str, client: AsyncOpenAI) -> dict:
+    """Takes user query and creates structured research plan."""
+    try:
+        prompt = f"""Analyze this research query and break it into 3-4 specific research directions that will lead to a comprehensive answer. Focus on what information is needed: {query}. Return as JSON with 'research_goals' array and 'reasoning' string."""
+        
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        
+        content = response.choices[0].message.content
+        return json.loads(content)
+        
+    except Exception as e:
+        return {
+            "research_goals": [f"Research {query}"],
+            "reasoning": f"Error in research planning: {str(e)}"
+        }
+
+async def extract_learnings(search_results: str, research_goal: str, client: AsyncOpenAI) -> dict:
+    """Takes raw search results and extracts key insights for a specific research goal."""
+    try:
+        prompt = f"""Extract key insights from these search results for research goal '{research_goal}'. Focus on facts, data, and actionable information. Identify knowledge gaps. Return as JSON with 'insights' array, 'gaps' array, and 'sources' array:
+
+Search Results:
+{search_results}"""
+        
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        
+        content = response.choices[0].message.content
+        return json.loads(content)
+        
+    except Exception as e:
+        return {
+            "insights": [f"Error extracting learnings: {str(e)}"],
+            "gaps": [],
+            "sources": []
+        }
+
+async def generate_next_queries(learnings: List[dict], original_query: str, client: AsyncOpenAI) -> List[str]:
+    """Based on current learnings, generates next search queries to fill gaps."""
+    try:
+        learnings_str = json.dumps(learnings, indent=2)
+        prompt = f"""Based on these research learnings, generate 2-4 specific search queries to complete research on '{original_query}'. Focus on filling knowledge gaps. Return as JSON array of strings:
+
+Learnings:
+{learnings_str}"""
+        
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        
+        content = response.choices[0].message.content
+        queries = json.loads(content)
+        
+        # Ensure we return a list of strings
+        if isinstance(queries, list):
+            return queries
+        else:
+            return [f"Research {original_query}"]
+            
+    except Exception as e:
+        return [f"Research {original_query} - error: {str(e)}"]
+
+async def synthesize_report(all_learnings: List[dict], original_query: str, client: AsyncOpenAI) -> str:
+    """Creates final markdown report from all research iterations."""
+    try:
+        learnings_str = json.dumps(all_learnings, indent=2)
+        prompt = f"""Create a comprehensive research report on '{original_query}' using these learnings. Include: Executive Summary, Main Findings, Supporting Evidence, and Sources. Format as markdown:
+
+Learnings:
+{learnings_str}"""
+        
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"# Research Report Error\n\nError generating report: {str(e)}"
