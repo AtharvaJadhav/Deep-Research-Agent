@@ -14,10 +14,10 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 async def search_web(query: str) -> str:
     """Search the web using Serper API or fallback to mock results."""
     try:
-        # TODO: Replace with your actual Serper API key
-        serper_api_key = os.getenv("SERPER_API_KEY", "your-serper-api-key-here")
+        # Get Serper API key from environment
+        serper_api_key = os.getenv("SERPER_API_KEY")
         
-        if serper_api_key == "your-serper-api-key-here":
+        if not serper_api_key or serper_api_key == "your-serper-api-key-here":
             # Fallback to mock results if no API key
             await asyncio.sleep(1)  # Simulate API delay
             
@@ -60,7 +60,14 @@ async def search_web(query: str) -> str:
             'Content-Type': 'application/json'
         }
         
-        async with aiohttp.ClientSession() as session:
+        # Create SSL context that doesn't verify certificates (for development)
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(url, headers=headers, data=payload) as response:
                 if response.status == 200:
                     data = await response.json()
