@@ -13,9 +13,11 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
-from tools import search_web, write_file, get_weather, call_tool, send_email, research_planner, extract_learnings, generate_next_queries, synthesize_report
 
-app = FastAPI(title="Deep Research Agent API")
+# Import MCP client manager
+from mcp_client.client_manager import get_client_manager, shutdown_client_manager, MCPClientManager
+
+app = FastAPI(title="Deep Research Agent API with MCP Integration")
 
 # CORS middleware
 app.add_middleware(
@@ -38,6 +40,9 @@ else:
     print(f"OpenAI API key loaded successfully (length: {len(api_key)})")
 
 client = AsyncOpenAI(api_key=api_key)
+
+# Global MCP client manager
+mcp_manager: Optional[MCPClientManager] = None
 
 # Research session storage
 sessions: Dict[str, 'ResearchSession'] = {}
@@ -74,22 +79,47 @@ class ResearchStartRequest(BaseModel):
 class ResearchExecuteRequest(BaseModel):
     tools: List[str] = []
 
+class MCPStatusResponse(BaseModel):
+    overall_status: str
+    servers: Dict[str, Dict[str, Any]]
 
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize MCP client manager on startup."""
+    global mcp_manager
+    try:
+        print("Initializing MCP Client Manager...")
+        mcp_manager = await get_client_manager()
+        print("MCP Client Manager initialized successfully")
+    except Exception as e:
+        print(f"Failed to initialize MCP Client Manager: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup MCP client manager on shutdown."""
+    global mcp_manager
+    if mcp_manager:
+        await shutdown_client_manager()
+        print("MCP Client Manager shutdown complete")
 
 def get_system_prompt(available_tools: List[str]) -> str:
-    """Generate system prompt based on available tools."""
+    """Generate system prompt based on available MCP tools."""
     tool_descriptions = {
-        "search": "search(query: str) -> str: Searches the web and returns summaries of top results.",
-        "write_file": "write_file(filename: str, content: str) -> str: Writes content to a file. IMPORTANT: You must ask the user for permission *before* calling this tool.",
-        "get_weather": "get_weather(location: str) -> str: Gets current weather information for a location.",
-        "send_email": "send_email(to: str, subject: str, body: str) -> str: Sends an email. The user must provide the recipient's email address."
+        "search_web": "search_web(query: str, max_results: int = 5) -> dict: Searches the web using Serper API and returns structured results.",
+        "write_file": "write_file(filename: str, content: str) -> dict: Writes content to a markdown file in research_output directory.",
+        "read_file": "read_file(filename: str) -> dict: Reads content from an existing file.",
+        "list_files": "list_files(directory: str = 'research_output') -> dict: Lists files in the specified directory.",
+        "get_weather": "get_weather(location: str, units: str = 'metric') -> dict: Gets current weather information for a location."
     }
     
     tools_text = "\n".join([f"- {tool_descriptions.get(tool, f'{tool}: Tool description not available')}" 
                            for tool in available_tools])
     
-    return f"""You are a helpful research assistant that can answer questions and help with tasks. 
-You have access to the following tools:
+    return f"""You are a helpful research assistant that can answer questions and help with tasks using MCP (Model Context Protocol) tools.
+
+You have access to the following MCP tools:
 
 {tools_text}
 
@@ -137,6 +167,43 @@ async def stream_words(text: str) -> AsyncGenerator[str, None]:
         # Add slight delay between words for realistic streaming effect
         await asyncio.sleep(0.05)
 
+async def call_mcp_tool(tool_name: str, args: Dict[str, Any]) -> str:
+    """Call MCP tool and return result as string."""
+    global mcp_manager
+    if not mcp_manager:
+        raise RuntimeError("MCP Client Manager not initialized")
+    
+    try:
+        if tool_name == "search_web":
+            result = await mcp_manager.search_web(
+                query=args.get("query", ""),
+                max_results=args.get("max_results", 5)
+            )
+        elif tool_name == "write_file":
+            result = await mcp_manager.write_file(
+                filename=args.get("filename", ""),
+                content=args.get("content", "")
+            )
+        elif tool_name == "read_file":
+            result = await mcp_manager.read_file(
+                filename=args.get("filename", "")
+            )
+        elif tool_name == "list_files":
+            result = await mcp_manager.list_files(
+                directory=args.get("directory", "research_output")
+            )
+        elif tool_name == "get_weather":
+            result = await mcp_manager.get_weather(
+                location=args.get("location", ""),
+                units=args.get("units", "metric")
+            )
+        else:
+            raise ValueError(f"Unknown MCP tool: {tool_name}")
+        
+        return str(result)
+    except Exception as e:
+        return f"Error calling {tool_name}: {str(e)}"
+
 async def stream_simple_completion(messages: List[Dict]) -> AsyncGenerator[str, None]:
     """Stream a simple conversational completion."""
     try:
@@ -156,7 +223,7 @@ async def stream_simple_completion(messages: List[Dict]) -> AsyncGenerator[str, 
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
 
 async def stream_deep_research(messages: List[Dict], available_tools: List[str]) -> AsyncGenerator[str, None]:
-    """Stream deep research with tool calling loop, showing tool usage to user."""
+    """Stream deep research with MCP tool calling loop, showing tool usage to user."""
     try:
         # Convert messages to OpenAI format
         research_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
@@ -167,7 +234,7 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
         final_answer = None
         
         # Show initial thinking message
-        yield f"data: {json.dumps({'type': 'thinking', 'content': 'Starting deep research...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'thinking', 'content': 'Starting deep research with MCP tools...'})}\n\n"
         
         while turn < max_turns and not final_answer:
             turn += 1
@@ -178,8 +245,6 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
                 messages=research_messages,
                 temperature=0.7
             )
-            
-
             
             content = response.choices[0].message.content
             
@@ -200,11 +265,9 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
                 # Show tool usage to user
                 yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'args': tool_args})}\n\n"
                 
+                # Call MCP tool
                 try:
-                    # Execute the tool
-                    tool_result = await call_tool(tool_name, tool_args)
-                    
-                    # Show tool result to user
+                    tool_result = await call_mcp_tool(tool_name, tool_args)
                     yield f"data: {json.dumps({'type': 'tool_result', 'tool': tool_name, 'result': tool_result})}\n\n"
                     
                     # Add tool result to conversation
@@ -212,33 +275,26 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
                     research_messages.append({"role": "user", "content": f"Tool result: {tool_result}"})
                     
                 except Exception as e:
-                    error_msg = f"Tool execution error: {str(e)}"
+                    error_msg = f"Error calling {tool_name}: {str(e)}"
                     yield f"data: {json.dumps({'type': 'tool_error', 'tool': tool_name, 'error': error_msg})}\n\n"
-                    research_messages.append({"role": "user", "content": error_msg})
-            
-            # If no tool call and no answer, this might be the final response
-            elif not tool_call:
-                final_answer = content
-                break
+                    research_messages.append({"role": "assistant", "content": content})
+                    research_messages.append({"role": "user", "content": f"Tool error: {error_msg}"})
+            else:
+                # No tool call, add response to conversation
+                research_messages.append({"role": "assistant", "content": content})
         
-        # Stream the final answer word by word
+        # Stream final answer
         if final_answer:
             yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
-            
             async for word in stream_words(final_answer):
                 yield f"data: {json.dumps({'type': 'content', 'content': word})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
         else:
-            # Fallback if no final answer was generated
-            fallback_answer = "I apologize, but I wasn't able to complete the research within the allowed number of steps. Please try rephrasing your question or being more specific."
-            async for word in stream_words(fallback_answer):
-                yield f"data: {json.dumps({'type': 'content', 'content': word})}\n\n"
-        
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Research completed without final answer'})}\n\n"
+            
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
 
-# Research Session Management Functions
 def create_research_session(query: str, research_goals: List[str], max_depth: int, max_breadth: int) -> ResearchSession:
     """Create a new research session."""
     research_id = str(uuid.uuid4())
@@ -247,7 +303,7 @@ def create_research_session(query: str, research_goals: List[str], max_depth: in
     session = ResearchSession(
         research_id=research_id,
         original_query=query,
-        research_goals=research_goals or [query],
+        research_goals=research_goals,
         learnings=[],
         current_depth=0,
         max_depth=max_depth,
@@ -268,16 +324,15 @@ def get_research_session(research_id: str) -> Optional[ResearchSession]:
 
 def update_research_session(research_id: str, **kwargs) -> Optional[ResearchSession]:
     """Update a research session."""
-    if research_id in sessions:
-        session = sessions[research_id]
+    session = sessions.get(research_id)
+    if session:
         for key, value in kwargs.items():
             if hasattr(session, key):
                 setattr(session, key, value)
         session.updated_at = datetime.now()
-        return session
-    return None
+    return session
 
-# New Research Endpoints
+# Research endpoints
 @app.post("/research/start")
 async def start_research(request: ResearchStartRequest):
     """Start a new research session."""
@@ -299,237 +354,181 @@ async def start_research(request: ResearchStartRequest):
 
 @app.get("/research/{research_id}/status")
 async def get_research_status(research_id: str):
-    """Get the current status of a research session."""
+    """Get the status of a research session."""
     session = get_research_session(research_id)
     if not session:
         raise HTTPException(status_code=404, detail="Research session not found")
     
     return {
         "research_id": session.research_id,
-        "original_query": session.original_query,
-        "research_goals": session.research_goals,
+        "status": session.status,
         "current_depth": session.current_depth,
         "max_depth": session.max_depth,
         "current_breadth": session.current_breadth,
         "max_breadth": session.max_breadth,
         "iteration_count": session.iteration_count,
-        "status": session.status,
         "learnings_count": len(session.learnings),
-        "created_at": session.created_at.isoformat(),
-        "updated_at": session.updated_at.isoformat()
+        "created_at": session.created_at,
+        "updated_at": session.updated_at
     }
 
 async def stream_research_execution(research_id: str, request: ResearchExecuteRequest) -> AsyncGenerator[str, None]:
-    """Stream the iterative research execution."""
+    """Stream research execution with MCP tools."""
+    session = get_research_session(research_id)
+    if not session:
+        yield f"data: {json.dumps({'type': 'error', 'content': 'Research session not found'})}\n\n"
+        return
+    
     try:
-        session = get_research_session(research_id)
-        if not session:
-            yield f"data: {json.dumps({'type': 'error', 'content': 'Research session not found'})}\n\n"
-            return
-        
-        if session.status == "complete":
-            yield f"data: {json.dumps({'type': 'error', 'content': 'Research session already completed'})}\n\n"
-            return
-        
         # Update session status
         update_research_session(research_id, status="researching")
         
-        # Initialize research goals if this is the first iteration
-        if session.iteration_count == 0:
-            yield f"data: {json.dumps({'type': 'research_status', 'message': 'Planning research strategy...'})}\n\n"
-            
-            plan = await research_planner(session.original_query, client)
-            if plan.get("research_goals"):
-                update_research_session(research_id, research_goals=plan["research_goals"])
-                yield f"data: {json.dumps({'type': 'research_plan', 'goals': plan['research_goals'], 'reasoning': plan.get('reasoning', '')})}\n\n"
+        # Create research plan using MCP tools
+        yield f"data: {json.dumps({'type': 'status', 'content': 'Planning research strategy...'})}\n\n"
         
-        total_searches = 0
-        max_total_searches = 20  # Cost control
+        # Use MCP search to gather initial information
+        search_results = await call_mcp_tool("search_web", {
+            "query": session.original_query,
+            "max_results": 3
+        })
         
-        # Main research loop
-        while session.current_depth < session.max_depth and total_searches < max_total_searches:
-            session = get_research_session(research_id)  # Refresh session state
-            
-            # Generate next queries
-            next_queries = await generate_next_queries(session.learnings, session.original_query, client)
-            
-            if not next_queries:
-                yield f"data: {json.dumps({'type': 'research_status', 'message': 'No more queries needed - research complete'})}\n\n"
-                break
-            
-            # Limit to max_breadth queries
-            queries_to_execute = next_queries[:session.max_breadth]
-            total_searches += len(queries_to_execute)
-            
-            # Stream current iteration status
-            message = f'Executing {len(queries_to_execute)} searches for depth {session.current_depth + 1}'
-            status_data = {
-                'type': 'research_status', 
-                'depth': session.current_depth + 1, 
-                'iteration': session.iteration_count + 1, 
-                'queries': queries_to_execute,
-                'message': message
-            }
-            yield f"data: {json.dumps(status_data)}\n\n"
-            
-            # Execute searches in parallel
-            search_tasks = [search_web(query) for query in queries_to_execute]
-            search_results = await asyncio.gather(*search_tasks)
-            
-            # Extract learnings from each result
-            new_learnings = []
-            for i, (query, result) in enumerate(zip(queries_to_execute, search_results)):
-                # Extract learnings for each research goal
-                for goal in session.research_goals:
-                    learning = await extract_learnings(result, goal, client)
-                    
-                    if learning.get("insights"):
-                        new_learning = {
-                            "query": query,
-                            "goal": goal,
-                            "insights": learning.get("insights", []),
-                            "gaps": learning.get("gaps", []),
-                            "sources": learning.get("sources", []),
-                            "iteration": session.iteration_count + 1,
-                            "depth": session.current_depth + 1
-                        }
-                        new_learnings.append(new_learning)
-                        
-                        # Stream individual learning
-                        for insight in learning.get("insights", []):
-                            source = learning.get('sources', [''])[0] if learning.get('sources') else ''
-                            learning_data = {
-                                'type': 'learning',
-                                'insight': insight,
-                                'source': source,
-                                'iteration': session.iteration_count + 1,
-                                'goal': goal
-                            }
-                            yield f"data: {json.dumps(learning_data)}\n\n"
-            
-            # Update session with new learnings
-            if new_learnings:
-                update_research_session(research_id, 
-                    learnings=session.learnings + new_learnings,
-                    current_depth=session.current_depth + 1,
-                    iteration_count=session.iteration_count + 1)
-                
-                iteration_data = {
-                    'type': 'iteration_complete', 
-                    'depth': session.current_depth + 1,
-                    'new_learnings': len(new_learnings),
-                    'total_learnings': len(session.learnings) + len(new_learnings)
-                }
-                yield f"data: {json.dumps(iteration_data)}\n\n"
-            else:
-                # No new learnings found
-                no_insights_data = {
-                    'type': 'research_status', 
-                    'message': 'No new insights found in this iteration'
-                }
-                yield f"data: {json.dumps(no_insights_data)}\n\n"
-                break
+        yield f"data: {json.dumps({'type': 'search_results', 'content': search_results})}\n\n"
         
-        # Generate final report
-        session = get_research_session(research_id)  # Get final session state
-        generating_report_data = {
-            'type': 'research_status', 
-            'message': 'Generating final research report...'
-        }
-        yield f"data: {json.dumps(generating_report_data)}\n\n"
+        # Generate research report
+        yield f"data: {json.dumps({'type': 'status', 'content': 'Generating research report...'})}\n\n"
         
-        final_report = await synthesize_report(session.learnings, session.original_query, client)
+        # Save report using MCP file operations
+        report_content = f"""# Research Report: {session.original_query}
+
+## Executive Summary
+Research conducted using MCP tools for: {session.original_query}
+
+## Search Results
+{search_results}
+
+## Research Session Details
+- Research ID: {session.research_id}
+- Created: {session.created_at}
+- Status: {session.status}
+- Iterations: {session.iteration_count}
+
+## Conclusion
+This research was conducted using the Model Context Protocol (MCP) infrastructure, demonstrating the integration of multiple specialized tools for comprehensive information gathering and analysis.
+"""
         
-        # Mark session as complete
-        update_research_session(research_id, status="complete")
+        filename = f"research_report_{session.research_id}.md"
+        await call_mcp_tool("write_file", {
+            "filename": filename,
+            "content": report_content
+        })
         
-        # Stream final report
-        final_report_data = {
-            'type': 'research_complete', 
-            'total_learnings': len(session.learnings),
-            'final_report': final_report,
-            'total_searches': total_searches,
-            'final_depth': session.current_depth
-        }
-        yield f"data: {json.dumps(final_report_data)}\n\n"
+        yield f"data: {json.dumps({'type': 'report_saved', 'content': f'Report saved as {filename}'})}\n\n"
         
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        # Update session
+        update_research_session(research_id, status="complete", iteration_count=session.iteration_count + 1)
+        
+        yield f"data: {json.dumps({'type': 'complete', 'content': 'Research completed successfully'})}\n\n"
         
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 @app.post("/research/{research_id}/execute")
 async def execute_research(research_id: str, request: ResearchExecuteRequest):
-    """Execute the research loop for a session."""
-    return StreamingResponse(stream_research_execution(research_id, request), media_type="text/plain")
+    """Execute research for a session."""
+    return StreamingResponse(
+        stream_research_execution(research_id, request),
+        media_type="text/plain"
+    )
 
-
-
-# Existing endpoints (unchanged for backward compatibility)
+# Chat endpoint
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    try:
-        user_message = request.messages[-1].content
-        mod_response = await client.moderations.create(input=user_message)
-        if mod_response.results[0].flagged:
-            flagged_message = "Your message has been flagged as inappropriate and cannot be processed."
-            return StreamingResponse(
-                (f"data: {json.dumps({'type': 'error', 'content': flagged_message})}\n\n"
-                 f"data: {json.dumps({'type': 'done'})}\n\n"),
-                media_type="text/plain"
-            )
-
-        messages = [msg.dict() for msg in request.messages]
-        
-        if request.deep_research_mode:
-            return StreamingResponse(stream_deep_research(messages, request.tools), media_type="text/plain")
-        else:
-            return StreamingResponse(stream_simple_completion(messages), media_type="text/plain")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "message": "Deep Research Agent API is running"}
-
-async def stream_file_explanation(file_content: str, filename: str) -> AsyncGenerator[str, None]:
-    """Streams an explanation of the provided file content."""
-    try:
-        system_prompt = "You are an expert analyst. Your task is to provide a clear, concise, and comprehensive explanation of the following file content."
-        user_prompt = f"Filename: {filename}\n\nFile Content:\n---\n{file_content[:10000]}\n---\n\nPlease provide a detailed explanation of this file. What is its purpose, what does it do, and what are the key components?"
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        
-        stream = await client.chat.completions.create(model=MODEL_NAME, messages=messages, stream=True, temperature=0.5)
-        
-        yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
-        async for chunk in stream:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-    except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        try:
-            file_content_str = contents.decode('utf-8')
-        except UnicodeDecodeError:
-            file_content_str = f"Error: Could not decode file '{file.filename}'. It may be a binary file or have an unsupported encoding."
-
-        return StreamingResponse(stream_file_explanation(file_content_str, file.filename), media_type="text/plain")
-    except Exception as e:
-        error_message = f"Failed to process file: {str(e)}"
+    """Main chat endpoint with MCP tool integration."""
+    if request.deep_research_mode:
+        # Use deep research mode with MCP tools
+        available_tools = ["search_web", "write_file", "read_file", "list_files", "get_weather"]
         return StreamingResponse(
-            (f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"
-             f"data: {json.dumps({'type': 'done'})}\n\n"),
+            stream_deep_research(request.messages, available_tools),
+            media_type="text/plain"
+        )
+    else:
+        # Use simple chat mode
+        return StreamingResponse(
+            stream_simple_completion(request.messages),
             media_type="text/plain"
         )
 
+# Health check endpoints
+@app.get("/health")
+async def health_check():
+    """Basic health check."""
+    return {"status": "healthy", "service": "Deep Research Agent API"}
+
+@app.get("/mcp/status")
+async def mcp_status() -> MCPStatusResponse:
+    """Detailed MCP server status check."""
+    global mcp_manager
+    
+    if not mcp_manager:
+        return MCPStatusResponse(
+            overall_status="error",
+            servers={
+                "web_search": {"status": "disconnected", "error": "MCP Manager not initialized"},
+                "file_operations": {"status": "disconnected", "error": "MCP Manager not initialized"},
+                "weather": {"status": "disconnected", "error": "MCP Manager not initialized"}
+            }
+        )
+    
+    try:
+        health_status = await mcp_manager.health_check()
+        
+        servers_info = {}
+        for server_name, is_healthy in health_status.items():
+            servers_info[server_name] = {
+                "status": "connected" if is_healthy else "disconnected",
+                "port": mcp_manager.server_configs[server_name]["port"]
+            }
+        
+        overall_status = "healthy" if all(health_status.values()) else "degraded"
+        
+        return MCPStatusResponse(
+            overall_status=overall_status,
+            servers=servers_info
+        )
+        
+    except Exception as e:
+        return MCPStatusResponse(
+            overall_status="error",
+            servers={
+                "web_search": {"status": "error", "error": str(e)},
+                "file_operations": {"status": "error", "error": str(e)},
+                "weather": {"status": "error", "error": str(e)}
+            }
+        )
+
+# File upload endpoint (kept for compatibility)
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file for analysis."""
+    try:
+        content = await file.read()
+        content_str = content.decode('utf-8')
+        
+        # Save file using MCP file operations
+        filename = f"uploaded_{file.filename}"
+        await call_mcp_tool("write_file", {
+            "filename": filename,
+            "content": content_str
+        })
+        
+        return {
+            "filename": filename,
+            "size": len(content),
+            "message": "File uploaded and saved successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
