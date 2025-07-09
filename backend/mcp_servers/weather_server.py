@@ -5,7 +5,7 @@ import random
 from typing import List, Dict, Any, Optional
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
-from mcp.server.tcp import tcp_server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, CallToolResult, TextContent
 import requests
 
@@ -177,7 +177,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
         )
 
 async def main():
-    logger.info("Starting MCP Weather Server on port 8003...")
+    logger.info("Starting MCP Weather Server...")
     
     # Log API key status
     if OPENWEATHER_API_KEY:
@@ -185,14 +185,16 @@ async def main():
     else:
         logger.info("No OpenWeatherMap API key found, will use mock data")
     
-    async with tcp_server(port=8003) as (read_stream, write_stream):
+    async with stdio_server() as (read_stream, write_stream):
+        from mcp.types import ServerCapabilities
+        
         await server.run(
             read_stream,
             write_stream,
             InitializationOptions(
                 server_name="weather-server",
                 server_version="1.0.0",
-                capabilities=server.get_capabilities(),
+                capabilities=ServerCapabilities(),
             ),
         )
 

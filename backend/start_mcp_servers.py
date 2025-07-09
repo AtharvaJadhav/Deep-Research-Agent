@@ -34,21 +34,18 @@ class MCPServerManager:
         self.servers = {
             "web_search": {
                 "script": "mcp_servers/web_search_server.py",
-                "port": 8001,
                 "name": "Web Search Server",
                 "process": None,
                 "pid": None
             },
             "file_operations": {
                 "script": "mcp_servers/file_operations_server.py", 
-                "port": 8002,
                 "name": "File Operations Server",
                 "process": None,
                 "pid": None
             },
             "weather": {
                 "script": "mcp_servers/weather_server.py",
-                "port": 8003,
                 "name": "Weather Server", 
                 "process": None,
                 "pid": None
@@ -57,34 +54,21 @@ class MCPServerManager:
         self.running = False
         self.startup_timeout = 30  # seconds per server
         
-    def check_port_available(self, port: int) -> bool:
-        """Check if a port is available."""
+    def check_server_health(self, process) -> bool:
+        """Check if a server process is healthy."""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                result = s.connect_ex(('localhost', port))
-                return result != 0  # Port is available if connection fails
+            return process.poll() is None  # Process is running if poll() returns None
         except Exception:
             return False
     
-    def check_server_health(self, port: int) -> bool:
-        """Check if a server is responding on the given port."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2)
-                result = s.connect_ex(('localhost', port))
-                return result == 0
-        except Exception:
-            return False
-    
-    async def wait_for_server(self, server_name: str, port: int, timeout: int) -> bool:
+    async def wait_for_server(self, server_name: str, process, timeout: int) -> bool:
         """Wait for a server to become ready."""
-        logger.info(f"Waiting for {server_name} to be ready on port {port}...")
+        logger.info(f"Waiting for {server_name} to be ready...")
         
         start_time = time.time()
         while time.time() - start_time < timeout:
-            if self.check_server_health(port):
-                logger.info(f"✅ {server_name} is ready on port {port}")
+            if self.check_server_health(process):
+                logger.info(f"✅ {server_name} is ready")
                 return True
             await asyncio.sleep(1)
         
@@ -94,7 +78,6 @@ class MCPServerManager:
     def start_server(self, server_name: str, server_config: Dict) -> bool:
         """Start a single MCP server process."""
         script_path = server_config["script"]
-        port = server_config["port"]
         name = server_config["name"]
         
         # Check if script exists
@@ -102,13 +85,8 @@ class MCPServerManager:
             logger.error(f"❌ Script not found: {script_path}")
             return False
         
-        # Check if port is available
-        if not self.check_port_available(port):
-            logger.error(f"❌ Port {port} is already in use")
-            return False
-        
         try:
-            logger.info(f"🚀 Starting {name} on port {port}...")
+            logger.info(f"🚀 Starting {name}...")
             
             # Start the server process
             process = subprocess.Popen(
@@ -144,7 +122,7 @@ class MCPServerManager:
             # Wait for server to be ready
             if not await self.wait_for_server(
                 server_config["name"], 
-                server_config["port"], 
+                server_config["process"], 
                 self.startup_timeout
             ):
                 logger.error(f"Health check failed for {server_config['name']}")
@@ -203,7 +181,7 @@ class MCPServerManager:
         """Check health of all running servers."""
         health_status = {}
         for server_name, server_config in self.servers.items():
-            is_healthy = self.check_server_health(server_config["port"])
+            is_healthy = self.check_server_health(server_config["process"])
             health_status[server_name] = is_healthy
             status = "✅" if is_healthy else "❌"
             logger.info(f"{status} {server_config['name']}: {'Healthy' if is_healthy else 'Unhealthy'}")
@@ -255,7 +233,7 @@ async def main():
         logger.info("🎯 MCP Servers Status:")
         logger.info("="*50)
         for server_name, server_config in manager.servers.items():
-            logger.info(f"  {server_config['name']}: localhost:{server_config['port']} (PID: {server_config['pid']})")
+            logger.info(f"  {server_config['name']}: PID {server_config['pid']}")
         logger.info("="*50)
         logger.info("🚀 All servers are ready!")
         logger.info("Press Ctrl+C to shutdown all servers")

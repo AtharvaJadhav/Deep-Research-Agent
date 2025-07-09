@@ -39,7 +39,9 @@ if not api_key or api_key == "api-key":
 else:
     print(f"OpenAI API key loaded successfully (length: {len(api_key)})")
 
-client = AsyncOpenAI(api_key=api_key)
+# Initialize OpenAI client - will be created per request to avoid compatibility issues
+def get_openai_client():
+    return AsyncOpenAI(api_key=api_key)
 
 # Global MCP client manager
 mcp_manager: Optional[MCPClientManager] = None
@@ -173,8 +175,11 @@ async def call_mcp_tool(tool_name: str, args: Dict[str, Any]) -> str:
     if not mcp_manager:
         raise RuntimeError("MCP Client Manager not initialized")
     
+    print(f"call_mcp_tool called with {tool_name} and args: {args}")
+    
     try:
         if tool_name == "search_web":
+            print(f"Calling web search with query: {args.get('query', '')}")
             result = await mcp_manager.search_web(
                 query=args.get("query", ""),
                 max_results=args.get("max_results", 5)
@@ -193,6 +198,7 @@ async def call_mcp_tool(tool_name: str, args: Dict[str, Any]) -> str:
                 directory=args.get("directory", "research_output")
             )
         elif tool_name == "get_weather":
+            print(f"Calling weather with location: {args.get('location', '')}")
             result = await mcp_manager.get_weather(
                 location=args.get("location", ""),
                 units=args.get("units", "metric")
@@ -200,6 +206,7 @@ async def call_mcp_tool(tool_name: str, args: Dict[str, Any]) -> str:
         else:
             raise ValueError(f"Unknown MCP tool: {tool_name}")
         
+        print(f"MCP tool {tool_name} returned result: {str(result)[:100]}...")
         return str(result)
     except Exception as e:
         return f"Error calling {tool_name}: {str(e)}"
@@ -208,9 +215,10 @@ async def stream_simple_completion(messages: List[Dict]) -> AsyncGenerator[str, 
     """Stream a simple conversational completion."""
     try:
         conversational_system_prompt = "You are a helpful and friendly conversational assistant. Respond directly to the user's query without using tools."
-        openai_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+        openai_messages = [{"role": msg.role, "content": msg.content} for msg in messages]
         openai_messages.insert(0, {"role": "system", "content": conversational_system_prompt})
         
+        client = get_openai_client()
         stream = await client.chat.completions.create(model=MODEL_NAME, messages=openai_messages, stream=True, temperature=0.7)
         
         yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
@@ -225,8 +233,10 @@ async def stream_simple_completion(messages: List[Dict]) -> AsyncGenerator[str, 
 async def stream_deep_research(messages: List[Dict], available_tools: List[str]) -> AsyncGenerator[str, None]:
     """Stream deep research with MCP tool calling loop, showing tool usage to user."""
     try:
+        print(f"Starting deep research with {len(available_tools)} available tools: {available_tools}")
+        
         # Convert messages to OpenAI format
-        research_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+        research_messages = [{"role": msg.role, "content": msg.content} for msg in messages]
         research_messages.insert(0, {"role": "system", "content": get_system_prompt(available_tools)})
         
         max_turns = 10
@@ -238,8 +248,11 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
         
         while turn < max_turns and not final_answer:
             turn += 1
+            print(f"Research turn {turn}/{max_turns}")
             
             # Get LLM response
+            client = get_openai_client()
+            print(f"Calling OpenAI API...")
             response = await client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=research_messages,
@@ -247,10 +260,14 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
             )
             
             content = response.choices[0].message.content
+            print(f"LLM Response: {content[:200]}...")
             
             # Parse response components
             tool_call = parse_tool_call(content)
             answer = parse_answer(content)
+            
+            print(f"Tool call found: {tool_call is not None}")
+            print(f"Answer found: {answer is not None}")
             
             # If we have a final answer, break and stream it
             if answer:
@@ -262,12 +279,16 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
                 tool_name = tool_call['name']
                 tool_args = tool_call.get('args', {})
                 
+                print(f"Calling MCP tool: {tool_name} with args: {tool_args}")
+                
                 # Show tool usage to user
                 yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'args': tool_args})}\n\n"
                 
                 # Call MCP tool
                 try:
+                    print(f"Starting MCP tool call for {tool_name}...")
                     tool_result = await call_mcp_tool(tool_name, tool_args)
+                    print(f"MCP tool {tool_name} completed successfully")
                     yield f"data: {json.dumps({'type': 'tool_result', 'tool': tool_name, 'result': tool_result})}\n\n"
                     
                     # Add tool result to conversation
@@ -276,6 +297,7 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
                     
                 except Exception as e:
                     error_msg = f"Error calling {tool_name}: {str(e)}"
+                    print(f"MCP tool {tool_name} failed: {str(e)}")
                     yield f"data: {json.dumps({'type': 'tool_error', 'tool': tool_name, 'error': error_msg})}\n\n"
                     research_messages.append({"role": "assistant", "content": content})
                     research_messages.append({"role": "user", "content": f"Tool error: {error_msg}"})
@@ -285,11 +307,13 @@ async def stream_deep_research(messages: List[Dict], available_tools: List[str])
         
         # Stream final answer
         if final_answer:
+            print(f"Research completed with final answer")
             yield f"data: {json.dumps({'type': 'start_answer'})}\n\n"
             async for word in stream_words(final_answer):
                 yield f"data: {json.dumps({'type': 'content', 'content': word})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         else:
+            print(f"Research completed without final answer")
             yield f"data: {json.dumps({'type': 'error', 'content': 'Research completed without final answer'})}\n\n"
             
     except Exception as e:
@@ -444,7 +468,11 @@ async def execute_research(research_id: str, request: ResearchExecuteRequest):
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """Main chat endpoint with MCP tool integration."""
+    print(f"DEBUG: Chat endpoint called with deep_research_mode: {request.deep_research_mode}")
+    print(f"DEBUG: Messages: {[msg.content[:50] + '...' if len(msg.content) > 50 else msg.content for msg in request.messages]}")
+    
     if request.deep_research_mode:
+        print("DEBUG: Using deep research mode with MCP tools")
         # Use deep research mode with MCP tools
         available_tools = ["search_web", "write_file", "read_file", "list_files", "get_weather"]
         return StreamingResponse(
@@ -452,6 +480,7 @@ async def chat_endpoint(request: ChatRequest):
             media_type="text/plain"
         )
     else:
+        print("DEBUG: Using simple chat mode")
         # Use simple chat mode
         return StreamingResponse(
             stream_simple_completion(request.messages),
@@ -463,6 +492,18 @@ async def chat_endpoint(request: ChatRequest):
 async def health_check():
     """Basic health check."""
     return {"status": "healthy", "service": "Deep Research Agent API"}
+
+@app.get("/debug")
+async def debug_endpoint():
+    """Debug endpoint to test if backend is receiving requests."""
+    print("DEBUG: Backend received a request to /debug endpoint")
+    return {"message": "Backend is working!", "timestamp": datetime.now().isoformat()}
+
+@app.post("/debug-post")
+async def debug_post_endpoint(request: dict):
+    """Debug POST endpoint to test if backend is receiving POST requests."""
+    print(f"DEBUG: Backend received POST request with data: {request}")
+    return {"message": "Backend POST is working!", "received_data": request, "timestamp": datetime.now().isoformat()}
 
 @app.get("/mcp/status")
 async def mcp_status() -> MCPStatusResponse:
@@ -485,8 +526,7 @@ async def mcp_status() -> MCPStatusResponse:
         servers_info = {}
         for server_name, is_healthy in health_status.items():
             servers_info[server_name] = {
-                "status": "connected" if is_healthy else "disconnected",
-                "port": mcp_manager.server_configs[server_name]["port"]
+                "status": "connected" if is_healthy else "disconnected"
             }
         
         overall_status = "healthy" if all(health_status.values()) else "degraded"

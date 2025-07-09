@@ -4,7 +4,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
-from mcp.server.tcp import tcp_server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, CallToolResult, TextContent
 import requests
 
@@ -116,15 +116,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
         )
 
 async def main():
-    logger.info("Starting MCP Web Search Server on port 8001...")
-    async with tcp_server(port=8001) as (read_stream, write_stream):
+    logger.info("Starting MCP Web Search Server...")
+    async with stdio_server() as (read_stream, write_stream):
+        from mcp.types import ServerCapabilities
+        
         await server.run(
             read_stream,
             write_stream,
             InitializationOptions(
                 server_name="web-search-server",
                 server_version="1.0.0",
-                capabilities=server.get_capabilities(),
+                capabilities=ServerCapabilities(),
             ),
         )
 

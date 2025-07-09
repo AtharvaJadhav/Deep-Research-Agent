@@ -35,21 +35,18 @@ class SystemOrchestrator:
         self.mcp_servers = {
             "web_search": {
                 "script": "mcp_servers/web_search_server.py",
-                "port": 8001,
                 "name": "Web Search Server",
                 "process": None,
                 "pid": None
             },
             "file_operations": {
                 "script": "mcp_servers/file_operations_server.py", 
-                "port": 8002,
                 "name": "File Operations Server",
                 "process": None,
                 "pid": None
             },
             "weather": {
                 "script": "mcp_servers/weather_server.py",
-                "port": 8003,
                 "name": "Weather Server", 
                 "process": None,
                 "pid": None
@@ -77,13 +74,10 @@ class SystemOrchestrator:
         except Exception:
             return False
     
-    def check_server_health(self, port: int) -> bool:
-        """Check if a server is responding on the given port."""
+    def check_mcp_server_health(self, process) -> bool:
+        """Check if an MCP server process is healthy."""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2)
-                result = s.connect_ex(('localhost', port))
-                return result == 0
+            return process.poll() is None  # Process is running if poll() returns None
         except Exception:
             return False
     
@@ -95,18 +89,27 @@ class SystemOrchestrator:
         except Exception:
             return False
     
-    async def wait_for_server(self, server_name: str, port: int, timeout: int, is_fastapi: bool = False) -> bool:
-        """Wait for a server to become ready."""
+    async def wait_for_mcp_server(self, server_name: str, process, timeout: int) -> bool:
+        """Wait for an MCP server to become ready."""
+        logger.info(f"Waiting for {server_name} to be ready...")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.check_mcp_server_health(process):
+                logger.info(f"✅ {server_name} is ready")
+                return True
+            await asyncio.sleep(1)
+        
+        logger.error(f"❌ {server_name} failed to start within {timeout} seconds")
+        return False
+    
+    async def wait_for_fastapi(self, server_name: str, port: int, timeout: int) -> bool:
+        """Wait for FastAPI app to become ready."""
         logger.info(f"Waiting for {server_name} to be ready on port {port}...")
         
         start_time = time.time()
         while time.time() - start_time < timeout:
-            if is_fastapi:
-                is_ready = self.check_fastapi_health(port)
-            else:
-                is_ready = self.check_server_health(port)
-            
-            if is_ready:
+            if self.check_fastapi_health(port):
                 logger.info(f"✅ {server_name} is ready on port {port}")
                 return True
             await asyncio.sleep(1)
@@ -114,10 +117,9 @@ class SystemOrchestrator:
         logger.error(f"❌ {server_name} failed to start within {timeout} seconds")
         return False
     
-    def start_server(self, server_name: str, server_config: Dict) -> bool:
+    def start_mcp_server(self, server_name: str, server_config: Dict) -> bool:
         """Start a single MCP server process."""
         script_path = server_config["script"]
-        port = server_config["port"]
         name = server_config["name"]
         
         # Check if script exists
@@ -125,13 +127,8 @@ class SystemOrchestrator:
             logger.error(f"❌ Script not found: {script_path}")
             return False
         
-        # Check if port is available
-        if not self.check_port_available(port):
-            logger.error(f"❌ Port {port} is already in use")
-            return False
-        
         try:
-            logger.info(f"🚀 Starting {name} on port {port}...")
+            logger.info(f"🚀 Starting {name}...")
             
             # Start the server process
             process = subprocess.Popen(
@@ -198,15 +195,15 @@ class SystemOrchestrator:
         
         # Start servers in order
         for server_name, server_config in self.mcp_servers.items():
-            if not self.start_server(server_name, server_config):
+            if not self.start_mcp_server(server_name, server_config):
                 logger.error(f"Failed to start {server_config['name']}")
                 await self.shutdown_all()
                 return False
             
             # Wait for server to be ready
-            if not await self.wait_for_server(
+            if not await self.wait_for_mcp_server(
                 server_config["name"], 
-                server_config["port"], 
+                server_config["process"], 
                 self.startup_timeout
             ):
                 logger.error(f"Health check failed for {server_config['name']}")
@@ -223,7 +220,7 @@ class SystemOrchestrator:
         # Double-check MCP servers are healthy
         logger.info("🔍 Verifying MCP servers before starting FastAPI...")
         for server_name, server_config in self.mcp_servers.items():
-            if not self.check_server_health(server_config["port"]):
+            if not self.check_mcp_server_health(server_config["process"]):
                 logger.error(f"MCP server {server_config['name']} is not healthy")
                 return False
         
@@ -232,11 +229,10 @@ class SystemOrchestrator:
             return False
         
         # Wait for FastAPI to be ready
-        if not await self.wait_for_server(
+        if not await self.wait_for_fastapi(
             self.fastapi_app["name"],
             self.fastapi_app["port"],
-            self.startup_timeout,
-            is_fastapi=True
+            self.startup_timeout
         ):
             logger.error("FastAPI app failed to start")
             await self.shutdown_all()
@@ -326,7 +322,7 @@ class SystemOrchestrator:
         
         # Check MCP servers
         for server_name, server_config in self.mcp_servers.items():
-            is_healthy = self.check_server_health(server_config["port"])
+            is_healthy = self.check_mcp_server_health(server_config["process"])
             health_status[server_name] = is_healthy
             status = "✅" if is_healthy else "❌"
             logger.info(f"{status} {server_config['name']}: {'Healthy' if is_healthy else 'Unhealthy'}")
@@ -401,16 +397,12 @@ async def main():
         logger.info("="*60)
         logger.info("MCP Servers:")
         for server_name, server_config in orchestrator.mcp_servers.items():
-            logger.info(f"  {server_config['name']}: localhost:{server_config['port']} (PID: {server_config['pid']})")
+            logger.info(f"  {server_config['name']}: PID {server_config['pid']}")
         logger.info("FastAPI App:")
         logger.info(f"  {orchestrator.fastapi_app['name']}: localhost:{orchestrator.fastapi_app['port']} (PID: {orchestrator.fastapi_app['pid']})")
         logger.info("="*60)
-        logger.info("🚀 Complete system is ready!")
-        logger.info("🌐 Frontend: http://localhost:3000")
-        logger.info("🔧 API: http://localhost:8000")
-        logger.info("📊 Health: http://localhost:8000/health")
-        logger.info("🔍 MCP Status: http://localhost:8000/mcp/status")
-        logger.info("Press Ctrl+C to shutdown all processes")
+        logger.info("🚀 All servers are ready!")
+        logger.info("Press Ctrl+C to shutdown all servers")
         logger.info("="*60 + "\n")
         
         # Start monitoring

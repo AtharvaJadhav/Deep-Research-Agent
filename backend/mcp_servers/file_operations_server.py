@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 from pathlib import Path
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
-from mcp.server.tcp import tcp_server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, CallToolResult, TextContent
 
 # Configure logging
@@ -239,18 +239,20 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
         )
 
 async def main():
-    logger.info("Starting MCP File Operations Server on port 8002...")
+    logger.info("Starting MCP File Operations Server...")
     # Ensure the default output directory exists
     ensure_directory(DEFAULT_OUTPUT_DIR)
     
-    async with tcp_server(port=8002) as (read_stream, write_stream):
+    async with stdio_server() as (read_stream, write_stream):
+        from mcp.types import ServerCapabilities
+        
         await server.run(
             read_stream,
             write_stream,
             InitializationOptions(
                 server_name="file-operations-server",
                 server_version="1.0.0",
-                capabilities=server.get_capabilities(),
+                capabilities=ServerCapabilities(),
             ),
         )
 
